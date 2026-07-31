@@ -18,16 +18,49 @@ mod mac {
     pub const ACCESSIBILITY_HINT: &str = "未授予「辅助功能」权限，系统会丢弃 QuickTrans 发出的复制指令。\
 请到 系统设置 → 隐私与安全性 → 辅助功能 中勾选 QuickTrans，再重新按快捷键。";
 
-    // 直接链系统框架，避免为一次权限检查引入额外 crate
+    /// `c` 键的 virtual keycode（Carbon `Events.h` 里的 `kVK_ANSI_C`）。
+    ///
+    /// 必须硬编码：enigo 的 `Key::Unicode('c')` 会去反查当前键盘布局下哪个 keycode
+    /// 打出 'c'，而那条路径最终调到 Carbon 的 `TISGetInputSourceProperty`，该 API 带
+    /// `dispatch_assert_queue(main)` 断言 —— 在非主线程调用直接 SIGTRAP 打死整个进程。
+    /// 取词跑在 tokio blocking 线程上，所以只能绕开反查、直接发 keycode。
+    ///
+    /// 硬编码 keycode 绑的是物理键位而非字符，但 ⌘C 在各主流布局上键位一致
+    /// （系统菜单快捷键本身就是按键位工作的），对复制这个用途是安全的。
+    pub const KEYCODE_C: u16 = 8;
+
+    // 直接链系统框架，避免为权限检查引入额外 crate
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXIsProcessTrusted() -> u8;
+        /// 是否已获得「发送合成事件」权限。不弹窗、不注册，纯查询。
+        fn CGPreflightPostEventAccess() -> u8;
+        /// 请求该权限：首次调用会弹系统授权窗，并把本 App 写进辅助功能列表。
+        /// 返回值只反映"当前是否已授权"，用户当场勾选后本次进程内一般不会变 true。
+        fn CGRequestPostEventAccess() -> u8;
     }
 
-    /// 进程是否已获得「辅助功能」授权。未授权时 enigo 合成的按键会被系统静默丢弃，
+    /// 进程是否能发出合成按键。未授权时 enigo 合成的按键会被系统静默丢弃，
     /// 取词结果永远为空 —— 必须提前区分，否则只会报「没有选中文本」误导用户。
+    ///
+    /// 发按键要的是 PostEvent 权限，它与 Accessibility 是两个独立的 TCC 条目，
+    /// 只是都显示在「隐私与安全性 → 辅助功能」下。两者任一成立即可放行：
+    /// 一般认为 Accessibility 覆盖 PostEvent，但 Apple 未作保证，故都查一遍。
     pub fn is_trusted() -> bool {
-        unsafe { AXIsProcessTrusted() != 0 }
+        unsafe { CGPreflightPostEventAccess() != 0 || AXIsProcessTrusted() != 0 }
+    }
+
+    /// 未授权时主动请求，让系统自己弹窗并把 App 加进辅助功能列表。
+    ///
+    /// 不这么做的话列表里根本不会出现 QuickTrans —— 纯 preflight/AXIsProcessTrusted
+    /// 只读状态、不向 TCC 注册，用户只能手动点 `+` 去翻二进制路径。
+    pub fn request_post_event_access() -> bool {
+        unsafe {
+            if CGPreflightPostEventAccess() != 0 {
+                return true;
+            }
+            CGRequestPostEventAccess() != 0
+        }
     }
 
     /// 打开 系统设置 → 隐私与安全性 → 辅助功能
@@ -106,11 +139,13 @@ fn platform_info() -> PlatformInfo {
     }
 }
 
-/// macOS：跳转到辅助功能授权面板；其他平台空操作
+/// macOS：请求授权（会让系统把本 App 注册进辅助功能列表）并跳转到授权面板；其他平台空操作
 #[tauri::command]
 fn open_accessibility_settings() {
     #[cfg(target_os = "macos")]
     {
+        // 先 request 再 open：request 负责把条目写进列表，否则用户跳过去也找不到 QuickTrans
+        let _ = mac::request_post_event_access();
         mac::open_accessibility_pane();
     }
 }
@@ -216,6 +251,13 @@ fn grab_selection() -> Result<String, String> {
     enigo
         .key(copy_mod, Direction::Press)
         .map_err(|e| e.to_string())?;
+    // macOS 走 raw(keycode)：Key::Unicode 会触发键盘布局反查，而那条路径调的
+    // Carbon API 只允许主线程调用，在这个 blocking 线程上会直接崩掉进程。详见 mac::KEYCODE_C。
+    #[cfg(target_os = "macos")]
+    enigo
+        .raw(mac::KEYCODE_C, Direction::Click)
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(target_os = "macos"))]
     enigo
         .key(Key::Unicode('c'), Direction::Click)
         .map_err(|e| e.to_string())?;
@@ -545,6 +587,12 @@ pub fn run() {
             // macOS：以「附属程序」身份运行 —— 不占 Dock、不进 Cmd+Tab，符合托盘常驻工具的惯例
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // macOS：启动时就请求发合成事件的权限。
+            // 这一步的意义是让系统弹授权窗、并把 QuickTrans 写进「辅助功能」列表 ——
+            // 只做 preflight 查询不会注册，列表里根本不会出现本 App，用户只能手动点 + 翻路径。
+            #[cfg(target_os = "macos")]
+            let _ = mac::request_post_event_access();
 
             // 载入配置
             let dir = app.path().app_config_dir()?;

@@ -107,11 +107,15 @@ bash mac-run.sh        # = npm install && npm run tauri dev
 
 QuickTrans 靠合成一次 `⌘C` 来取走你选中的文本。**未授权时 macOS 会静默丢弃这个按键**，取词永远为空。
 
-1. 系统设置 → 隐私与安全性 → **辅助功能**
-2. 打开 QuickTrans 的开关（`tauri dev` 模式下条目名可能显示为 `quicktrans`）
+App 一启动就会调 `CGRequestPostEventAccess()` 主动请求，所以：
+
+1. 首次启动应该会**自动弹出系统授权窗** —— 直接点「打开系统设置」授权即可
+2. 系统设置 → 隐私与安全性 → **辅助功能**，打开 QuickTrans 的开关
 3. 回到设置窗点「重新检测」
 
-首次启动若检测到没授权，会自动弹出设置窗，里面有「打开授权面板」按钮直达。
+首次启动若检测到没授权，也会自动弹出设置窗，里面的「打开授权面板」按钮同样会先请求权限再跳转。
+
+> 严格来说发合成按键要的是 **PostEvent** 权限，与 Accessibility 是两个独立的 TCC 条目，只是都显示在「辅助功能」面板下。必须**主动 request 才会把 App 注册进那个列表** —— 只做 `AXIsProcessTrusted()` 之类的查询不会注册，列表里就一直看不到 QuickTrans。
 
 > ⚠️ **每次重新编译，二进制变了，授权就会失效**，需要在列表里删掉旧条目重新勾选。开发阶段这个很烦但绕不开 —— 除非用固定的开发者证书签名。
 
@@ -201,6 +205,8 @@ macOS 上 `Alt` = `⌥ Option`，`Super`（也可写 `Cmd`）= `⌘ Command`，�
 **macOS**
 
 - **按快捷键提示「未授予辅助功能权限」**：见上面第 3 步。**重新编译后需要重新授权**。
+- **辅助功能列表里找不到 QuickTrans**：必须由 App 主动 `CGRequestPostEventAccess()` 才会注册进去（启动时会自动调）。若仍缺失，可用 `tccutil reset PostEvent com.quicktrans.app` 重置后重启 App 再试；手动添加则在列表里点 `+`，用 `⌘⇧G` 输入 `.app` 内可执行文件的完整路径（默认对话框只显示 `/Applications`）。
+- **按快捷键后 App 直接崩溃（`EXC_BREAKPOINT` / `SIGTRAP`）**：已修。成因是 enigo 的 `Key::Unicode` 会反查键盘布局，那条路径调的 Carbon `TISGetInputSourceProperty` 带主线程断言，而取词跑在 tokio blocking 线程上。现在改成直接发 `⌘C` 的 virtual keycode，不再反查。
 - **浮窗是不透明黑块，没有毛玻璃**：`tauri.conf.json` 里的 `app.macOSPrivateApi` 必须为 `true`，且 `Cargo.toml` 里 tauri 要开 `macos-private-api` feature —— 两者缺一不可。
 - **菜单栏图标是彩色的、很脏**：`src-tauri/icons/tray-mac.png` 应该是纯黑字形 + 透明背景的 template 图；重新跑 `python3 gen_icons.py` 生成。
 - **打包报找不到 `icon.icns`**：跑 `python3 gen_icons.py`（纯 Python 生成，不依赖 macOS 的 `iconutil`），或用 `npx tauri icon src-tauri/icons/icon.png`。
