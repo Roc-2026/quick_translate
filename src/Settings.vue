@@ -10,6 +10,11 @@ interface Config {
   hotkey: string;
 }
 
+interface PlatformInfo {
+  os: string;
+  accessibility_ok: boolean;
+}
+
 const api_key = ref("");
 const model = ref("deepseek-chat");
 const target_lang = ref("中文");
@@ -21,9 +26,35 @@ const saving = ref(false);
 const saved = ref(false);
 const errorMsg = ref("");
 
+const isMac = ref(false);
+const axOk = ref(true);
+const axChecking = ref(false);
+
 const LANGS = ["中文", "English", "日本語", "한국어", "Français", "Deutsch"];
 
+async function refreshPlatform() {
+  try {
+    const p = await invoke<PlatformInfo>("platform_info");
+    isMac.value = p.os === "macos";
+    axOk.value = p.accessibility_ok;
+  } catch {
+    // 拿不到就当无需授权，不打扰用户
+  }
+}
+
+async function grantAccessibility() {
+  await invoke("open_accessibility_settings");
+}
+
+/** 系统设置里勾选后不会通知回来，只能让用户手动点一下重新检测 */
+async function recheckAccessibility() {
+  axChecking.value = true;
+  await refreshPlatform();
+  setTimeout(() => (axChecking.value = false), 400);
+}
+
 onMounted(async () => {
+  await refreshPlatform();
   try {
     const c = await invoke<Config>("get_config");
     api_key.value = c.api_key ?? "";
@@ -69,6 +100,32 @@ async function save(closeAfter: boolean) {
     <h1>QuickTrans 设置</h1>
     <p class="sub">配置你的 DeepSeek 账号与快捷键，保存后立即生效。</p>
 
+    <div v-if="isMac" class="perm" :class="{ bad: !axOk }">
+      <div class="perm-head">
+        <span class="perm-icon">{{ axOk ? "✓" : "⚠" }}</span>
+        <span class="perm-title">
+          辅助功能权限{{ axOk ? "已授予" : "未授予" }}
+        </span>
+      </div>
+      <p class="perm-desc">
+        <template v-if="axOk">
+          QuickTrans 可以正常读取其他 App 里选中的文本。
+        </template>
+        <template v-else>
+          macOS 会丢弃未授权 App 发出的复制指令，取词会一直失败。请在
+          系统设置 → 隐私与安全性 → 辅助功能 中勾选 QuickTrans，然后回来点「重新检测」。
+        </template>
+      </p>
+      <div v-if="!axOk" class="perm-actions">
+        <button class="ghost" type="button" @click="grantAccessibility">
+          打开授权面板
+        </button>
+        <button class="ghost" type="button" :disabled="axChecking" @click="recheckAccessibility">
+          {{ axChecking ? "检测中…" : "重新检测" }}
+        </button>
+      </div>
+    </div>
+
     <label class="field">
       <span class="lab">DeepSeek API Key <em>必填</em></span>
       <div class="key-row">
@@ -101,7 +158,11 @@ async function save(closeAfter: boolean) {
     <label class="field">
       <span class="lab">全局快捷键</span>
       <input v-model="hotkey" placeholder="Ctrl+Alt+T" spellcheck="false" />
-      <span class="tip">
+      <span v-if="isMac" class="tip">
+        格式如 <code>Ctrl+Alt+T</code>、<code>Cmd+Shift+E</code>。修饰键
+        Ctrl（⌃）/ Alt（⌥ Option）/ Shift（⇧）/ Cmd（⌘），主键 a-z、0-9、F1-F12、Space。
+      </span>
+      <span v-else class="tip">
         格式如 <code>Ctrl+Alt+T</code>、<code>Alt+F2</code>。修饰键 Ctrl / Alt / Shift / Super，
         主键 a-z、0-9、F1-F12、Space。
       </span>
@@ -156,6 +217,51 @@ h1 {
 .field {
   display: block;
   margin-bottom: 16px;
+}
+
+/* macOS 辅助功能授权状态卡片 */
+.perm {
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  background: rgba(52, 211, 153, 0.08);
+}
+.perm.bad {
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.1);
+}
+.perm-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.perm-icon {
+  color: #34d399;
+  font-size: 13px;
+}
+.perm.bad .perm-icon {
+  color: #f59e0b;
+}
+.perm-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #c3c7d0;
+}
+.perm-desc {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #8a8f99;
+}
+.perm-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.perm-actions button {
+  padding: 6px 12px;
+  font-size: 12px;
 }
 .lab {
   display: block;

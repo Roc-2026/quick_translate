@@ -1,6 +1,9 @@
 :root {
   color-scheme: dark;
-  font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  /* mac 优先 SF Pro / 苹方，Windows 优先微软雅黑。
+     顺序放反的话 macOS 上会落到 fallback 字体，中文字重和行高都会不对 */
+  font-family: -apple-system, "PingFang SC", "Segoe UI", "Microsoft YaHei",
+    system-ui, sans-serif;
 }
 
 * {

@@ -30,6 +30,17 @@ function onKey(e: KeyboardEvent) {
   if (e.key === "Escape") hide();
 }
 
+/**
+ * 拦掉双击标题栏的「缩放窗口」。
+ *
+ * Tauri 的 drag region 脚本在 macOS 上是在 document 的 mouseup 里触发 zoom 的
+ * （Windows/Linux 走 mousedown），双击把这个小浮窗放大成一整块很怪。
+ * 在 header 这一层截断冒泡即可，单击拖动走的是 mousedown，不受影响。
+ */
+function swallowTitleBarZoom(e: MouseEvent) {
+  if (e.detail >= 2) e.stopPropagation();
+}
+
 async function scrollToBottom() {
   await nextTick();
   if (bodyEl.value) bodyEl.value.scrollTop = bodyEl.value.scrollHeight;
@@ -82,7 +93,7 @@ onUnmounted(() => {
 
 <template>
   <div class="card">
-    <header class="bar" data-tauri-drag-region>
+    <header class="bar" data-tauri-drag-region="deep" @mouseup="swallowTitleBarZoom">
       <span class="title">
         <span class="dot" :class="{ spin: loading }"></span>
         划词翻译

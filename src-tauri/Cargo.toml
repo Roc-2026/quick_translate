@@ -13,11 +13,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# macos-private-api：macOS 上透明窗口必需（否则浮窗渲染成不透明黑块）
+# image-png：托盘 template 图用 Image::from_bytes 加载，该方法被 image-png/image-ico 门控
+tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-png"] }
 tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# rustls-tls：避免在 Windows 上折腾 OpenSSL
+# rustls-tls：避免在 Windows 上折腾 OpenSSL，macOS 上也省掉 Security.framework 的麻烦
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
 arboard = "3"

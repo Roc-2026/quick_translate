@@ -4,12 +4,39 @@ mod deepseek;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent,
+    Emitter, Manager, Monitor, WebviewWindow, WindowEvent,
 };
+
+// ============ macOS 平台相关 ============
+
+#[cfg(target_os = "macos")]
+mod mac {
+    pub const ACCESSIBILITY_HINT: &str = "未授予「辅助功能」权限，系统会丢弃 QuickTrans 发出的复制指令。\
+请到 系统设置 → 隐私与安全性 → 辅助功能 中勾选 QuickTrans，再重新按快捷键。";
+
+    // 直接链系统框架，避免为一次权限检查引入额外 crate
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrusted() -> u8;
+    }
+
+    /// 进程是否已获得「辅助功能」授权。未授权时 enigo 合成的按键会被系统静默丢弃，
+    /// 取词结果永远为空 —— 必须提前区分，否则只会报「没有选中文本」误导用户。
+    pub fn is_trusted() -> bool {
+        unsafe { AXIsProcessTrusted() != 0 }
+    }
+
+    /// 打开 系统设置 → 隐私与安全性 → 辅助功能
+    pub fn open_accessibility_pane() {
+        let _ = std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .spawn();
+    }
+}
 
 /// 全局运行期状态
 struct AppState {
@@ -43,7 +70,49 @@ fn open_config_dir(app: tauri::AppHandle) -> Result<(), String> {
             .spawn()
             .map_err(|e| e.to_string())?;
     }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+/// 平台信息 + macOS 辅助功能授权状态，供设置界面按平台渲染
+#[derive(Serialize)]
+struct PlatformInfo {
+    os: &'static str,
+    /// 非 macOS 恒为 true（无需该权限）
+    accessibility_ok: bool,
+}
+
+/// macOS 上未授权辅助功能时取词必然失败，需要引导用户先去授权
+#[cfg(target_os = "macos")]
+fn accessibility_ok() -> bool {
+    mac::is_trusted()
+}
+#[cfg(not(target_os = "macos"))]
+fn accessibility_ok() -> bool {
+    true
+}
+
+#[tauri::command]
+fn platform_info() -> PlatformInfo {
+    PlatformInfo {
+        os: std::env::consts::OS,
+        accessibility_ok: accessibility_ok(),
+    }
+}
+
+/// macOS：跳转到辅助功能授权面板；其他平台空操作
+#[tauri::command]
+fn open_accessibility_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        mac::open_accessibility_pane();
+    }
 }
 
 #[tauri::command]
@@ -100,36 +169,62 @@ fn non_empty(v: &str, default: &str) -> String {
     }
 }
 
-// ============ 取词：模拟 Ctrl+C 并读取剪贴板（阻塞，放到 blocking 线程） ============
+// ============ 取词：模拟复制快捷键并读取剪贴板（阻塞，放到 blocking 线程） ============
 
 fn grab_selection() -> Result<String, String> {
     use arboard::Clipboard;
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
+    // 未授权时按键会被系统吞掉，先拦下来给出可操作的提示
+    #[cfg(target_os = "macos")]
+    {
+        if !mac::is_trusted() {
+            return Err(mac::ACCESSIBILITY_HINT.to_string());
+        }
+    }
+
+    // macOS 的复制键是 Cmd（enigo 的 Key::Meta 在 macOS 映射到 Command），其余平台是 Ctrl。
+    // 释放修饰键时 Windows 侧刻意不碰 Meta —— 单独发一个 Win 键抬起会招来开始菜单。
+    #[cfg(target_os = "macos")]
+    let copy_mod = Key::Meta;
+    #[cfg(target_os = "macos")]
+    let release_mods: &[Key] = &[Key::Meta, Key::Alt, Key::Shift, Key::Control];
+
+    #[cfg(not(target_os = "macos"))]
+    let copy_mod = Key::Control;
+    #[cfg(not(target_os = "macos"))]
+    let release_mods: &[Key] = &[Key::Alt, Key::Shift, Key::Control];
+
+    // macOS 合成事件的投递与剪贴板回写都比 Windows 慢，等待时间相应放宽
+    #[cfg(target_os = "macos")]
+    let (settle, wait) = (Duration::from_millis(180), Duration::from_millis(220));
+    #[cfg(not(target_os = "macos"))]
+    let (settle, wait) = (Duration::from_millis(120), Duration::from_millis(140));
+
     let mut cb = Clipboard::new().map_err(|e| e.to_string())?;
     let backup = cb.get_text().ok();
 
     // 等用户松开触发组合键，避免修饰键干扰
-    std::thread::sleep(Duration::from_millis(120));
+    std::thread::sleep(settle);
 
     let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
     // 先释放可能仍被按住的修饰键
-    let _ = enigo.key(Key::Alt, Direction::Release);
-    let _ = enigo.key(Key::Shift, Direction::Release);
-    let _ = enigo.key(Key::Control, Direction::Release);
-    // 发送 Ctrl+C
+    for k in release_mods {
+        let _ = enigo.key(*k, Direction::Release);
+    }
+    // 发送 Cmd+C / Ctrl+C
     enigo
-        .key(Key::Control, Direction::Press)
+        .key(copy_mod, Direction::Press)
         .map_err(|e| e.to_string())?;
     enigo
         .key(Key::Unicode('c'), Direction::Click)
         .map_err(|e| e.to_string())?;
     enigo
-        .key(Key::Control, Direction::Release)
+        .key(copy_mod, Direction::Release)
         .map_err(|e| e.to_string())?;
 
     // 等系统把选区写入剪贴板
-    std::thread::sleep(Duration::from_millis(140));
+    std::thread::sleep(wait);
     let text = cb.get_text().unwrap_or_default();
 
     // 还原用户原有剪贴板内容
@@ -140,19 +235,119 @@ fn grab_selection() -> Result<String, String> {
     Ok(text)
 }
 
-/// 读取鼠标当前位置（物理像素）
+/// 读取鼠标当前位置。
+///
+/// 单位跨平台不一致：Windows 上 enigo 返回物理像素，macOS 上返回逻辑点。
+/// 下面所有摆放计算都统一在「光标所在坐标系」里做，最后再按平台选窗口坐标类型。
 fn cursor_pos() -> Option<(i32, i32)> {
     use enigo::{Enigo, Mouse, Settings};
     let enigo = Enigo::new(&Settings::default()).ok()?;
     enigo.location().ok()
 }
 
+/// 物理像素 → 光标坐标系的换算系数。macOS 用逻辑点需要除以缩放比，Windows 本来就是物理像素。
+#[cfg(target_os = "macos")]
+#[inline]
+fn px_per_unit(scale_factor: f64) -> f64 {
+    scale_factor
+}
+#[cfg(not(target_os = "macos"))]
+#[inline]
+fn px_per_unit(_scale_factor: f64) -> f64 {
+    1.0
+}
+
+/// 找到包含该光标位置的显示器；找不到就退回窗口当前所在的显示器。
+fn monitor_at(win: &WebviewWindow, x: f64, y: f64) -> Option<Monitor> {
+    win.available_monitors()
+        .ok()
+        .and_then(|mons| {
+            mons.into_iter().find(|m| {
+                let k = px_per_unit(m.scale_factor());
+                let (p, s) = (m.position(), m.size());
+                let (ox, oy) = (p.x as f64 / k, p.y as f64 / k);
+                let (w, h) = (s.width as f64 / k, s.height as f64 / k);
+                x >= ox && y >= oy && x < ox + w && y < oy + h
+            })
+        })
+        .or_else(|| win.current_monitor().ok().flatten())
+}
+
+/// 把浮窗摆在光标旁，并夹回所在显示器的工作区，避免在屏幕边缘被截断。
+fn place_popup_near_cursor(win: &WebviewWindow, cx: f64, cy: f64) {
+    const OFF_X: f64 = 12.0;
+    const OFF_Y: f64 = 18.0;
+    const GAP: f64 = 8.0;
+
+    let mon = monitor_at(win, cx, cy);
+
+    // 窗口尺寸：outer_size() 是相对「窗口当前所在屏」的物理像素，必须用窗口自己的缩放比来换算。
+    // 用光标所在屏的缩放比，会在两块屏 DPI 不同时把尺寸算成一半或两倍，翻转/夹取就全错了。
+    let ws = win
+        .scale_factor()
+        .ok()
+        .or_else(|| mon.as_ref().map(|m| m.scale_factor()))
+        .unwrap_or(1.0);
+    let wk = px_per_unit(ws);
+
+    // 兜底值取自 tauri.conf.json 里 main 窗口的「逻辑」尺寸；
+    // ws / wk 把逻辑单位换算到光标坐标系（macOS 恒为 1，Windows 上是缩放比）。
+    let (mut w, mut h) = (420.0 * ws / wk, 340.0 * ws / wk);
+    if let Ok(size) = win.outer_size() {
+        if size.width > 0 && size.height > 0 {
+            w = size.width as f64 / wk;
+            h = size.height as f64 / wk;
+        }
+    }
+
+    let mut px = cx + OFF_X;
+    let mut py = cy + OFF_Y;
+
+    if let Some(m) = mon {
+        let mk = px_per_unit(m.scale_factor());
+        let area = m.work_area();
+        // 某些平台可能给不出有效工作区，此时退回整块屏幕
+        let (ax, ay, aw, ah) = if area.size.width > 0 && area.size.height > 0 {
+            (
+                area.position.x as f64 / mk,
+                area.position.y as f64 / mk,
+                area.size.width as f64 / mk,
+                area.size.height as f64 / mk,
+            )
+        } else {
+            let (p, s) = (m.position(), m.size());
+            (
+                p.x as f64 / mk,
+                p.y as f64 / mk,
+                s.width as f64 / mk,
+                s.height as f64 / mk,
+            )
+        };
+
+        // 右/下方放不下就翻到光标另一侧，再整体夹进工作区
+        if px + w > ax + aw - GAP {
+            px = cx - OFF_X - w;
+        }
+        if py + h > ay + ah - GAP {
+            py = cy - OFF_Y - h;
+        }
+        px = px.clamp(ax + GAP, (ax + aw - w - GAP).max(ax + GAP));
+        py = py.clamp(ay + GAP, (ay + ah - h - GAP).max(ay + GAP));
+    }
+
+    #[cfg(target_os = "macos")]
+    let _ = win.set_position(tauri::LogicalPosition::new(px, py));
+    #[cfg(not(target_os = "macos"))]
+    let _ = win.set_position(tauri::PhysicalPosition::new(px as i32, py as i32));
+}
+
 /// 在鼠标附近显示浮窗
 fn show_popup(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if let Some((x, y)) = cursor_pos() {
-            let _ = win.set_position(PhysicalPosition::new(x + 12, y + 18));
+            place_popup_near_cursor(&win, x as f64, y as f64);
         }
+        // show 必须在 set_focus 之前：窗口不可见时 set_focus 是空操作，别调换顺序
         let _ = win.show();
         let _ = win.set_focus();
     }
@@ -160,6 +355,9 @@ fn show_popup(app: &tauri::AppHandle) {
 
 fn show_settings(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("settings") {
+        // 顺序有讲究：窗口不可见时 set_focus 直接空操作，所以必须 show → unminimize → set_focus。
+        // macOS 上把 Accessory 应用拉到前台靠的也是 set_focus（内部走 activateIgnoringOtherApps），
+        // AppHandle::show() 只是 ⌘H 的逆操作、对没隐藏过的应用没用，所以这里不需要它。
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
@@ -201,16 +399,14 @@ fn trigger_translate(app: &tauri::AppHandle) {
             guard.clone()
         };
 
-        show_popup(&app);
-
+        // Key 没配就别弹浮窗了：紧接着打开设置窗会让浮窗失焦、被自动隐藏，
+        // 那条错误用户根本来不及看。直接把设置窗顶出来更有用。
         if cfg.api_key.is_empty() {
-            let _ = app.emit(
-                "tr://error",
-                "未配置 DeepSeek API Key。请点击托盘图标 →「设置」填入后再试。".to_string(),
-            );
             show_settings(&app);
             return;
         }
+
+        show_popup(&app);
 
         let _ = app.emit(
             "tr://start",
@@ -330,14 +526,32 @@ fn reload_config(app: &tauri::AppHandle) {
 
 // ============ 入口 ============
 
+/// 托盘图标：macOS 菜单栏要 template 图（只保留 alpha，由系统按明暗自动反色），
+/// 直接放彩色图在深色菜单栏里会很脏；其余平台沿用应用图标。
+fn tray_icon(app: &tauri::App) -> tauri::image::Image<'_> {
+    #[cfg(target_os = "macos")]
+    {
+        const TRAY_PNG: &[u8] = include_bytes!("../icons/tray-mac.png");
+        if let Ok(img) = tauri::image::Image::from_bytes(TRAY_PNG) {
+            return img;
+        }
+    }
+    app.default_window_icon().unwrap().clone()
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            // macOS：以「附属程序」身份运行 —— 不占 Dock、不进 Cmd+Tab，符合托盘常驻工具的惯例
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             // 载入配置
             let dir = app.path().app_config_dir()?;
             let cfg = config::Config::load(&dir);
             let hotkey = cfg.hotkey.clone();
-            let need_settings = cfg.api_key.trim().is_empty();
+            // 缺 Key，或 macOS 上还没拿到辅助功能授权，都先把设置窗顶出来
+            let need_settings = cfg.api_key.trim().is_empty() || !accessibility_ok();
             app.manage(AppState {
                 config: Mutex::new(cfg),
             });
@@ -356,7 +570,8 @@ pub fn run() {
                 &[&settings_i, &open_dir_i, &reload_i, &sep, &quit_i],
             )?;
             TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon(app))
+                .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("QuickTrans 划词翻译")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -421,7 +636,9 @@ pub fn run() {
             open_config_dir,
             open_settings,
             get_config,
-            save_config
+            save_config,
+            platform_info,
+            open_accessibility_settings
         ])
         .run(tauri::generate_context!())
         .expect("启动 QuickTrans 失败");
