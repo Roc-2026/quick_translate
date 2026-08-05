@@ -1,7 +1,10 @@
 {
   "api_key": "在这里填入你的 DeepSeek API Key（sk-...）",
-  "model": "deepseek-chat",
+  "model": "deepseek-v4-flash",
   "target_lang": "中文",
   "base_url": "https://api.deepseek.com",
-  "hotkey": "Ctrl+Alt+T"
+  "hotkey": "Ctrl+Alt+T",
+  "ask_hotkey": "Cmd+B",
+  "ask_include_selection": true,
+  "ask_thinking": false
 }

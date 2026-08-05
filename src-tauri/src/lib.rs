@@ -5,11 +5,23 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     Emitter, Manager, Monitor, WebviewWindow, WindowEvent,
 };
+use tauri_plugin_global_shortcut::Shortcut;
+
+/// 问答窗的系统提示。翻译那边的 prompt 在 deepseek.rs 里就地拼。
+const ASK_SYSTEM_PROMPT: &str = "你是一个严谨、简洁的助手，正在一个桌面小浮窗里回答问题。\
+直接给结论，需要时再展开；不确定就明说，不要编造。默认用中文回答，除非用户用其他语言提问。";
+
+// macOS 的 NSWindowLevel。非 macOS 上不会被用到，放在这里只是为了让调用点不必到处写 cfg。
+/// NSFloatingWindowLevel
+const LEVEL_FLOATING: isize = 3;
+/// NSStatusWindowLevel，比菜单栏(24)还高一档
+const LEVEL_STATUS: isize = 25;
 
 // ============ macOS 平台相关 ============
 
@@ -28,6 +40,46 @@ mod mac {
     /// 硬编码 keycode 绑的是物理键位而非字符，但 ⌘C 在各主流布局上键位一致
     /// （系统菜单快捷键本身就是按键位工作的），对复制这个用途是安全的。
     pub const KEYCODE_C: u16 = 8;
+
+    // NSWindowCollectionBehavior 的位（AppKit/NSWindow.h）
+    /// 窗口出现在所有 Space —— 缺了它，在别的 App 的全屏 Space 里按快捷键，
+    /// 系统会把你拽回 QuickTrans 自己的 Space 再显示窗口，看起来就是「没反应」。
+    const CB_CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    /// Space 切换时不跟着做位移动画
+    const CB_STATIONARY: usize = 1 << 4;
+    /// 允许与别的 App 的全屏窗口共存于同一 Space。和上面那一位缺一不可。
+    const CB_FULLSCREEN_AUXILIARY: usize = 1 << 8;
+
+    /// 让窗口能盖在别的 App 的全屏窗口上。
+    ///
+    /// tao 的 `set_visible_on_all_workspaces()` 只设了 `CanJoinAllSpaces`，
+    /// 少了 `FullScreenAuxiliary`，在全屏 App 上仍然出不来，所以这里直接发消息。
+    ///
+    /// `level` 传 `None` 表示保持窗口原有层级（普通窗口用，比如设置窗）。
+    ///
+    /// **必须在主线程调用** —— AppKit 的硬性要求。
+    pub fn make_overlay(win: &tauri::WebviewWindow, level: Option<isize>) {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+
+        let Ok(ptr) = win.ns_window() else { return };
+        if ptr.is_null() {
+            return;
+        }
+        let ns = ptr as *mut AnyObject;
+        // 显式标注类型：msg_send! 不查头文件，参数得自带完整类型
+        // （NSWindowCollectionBehavior 是 NSUInteger，NSWindowLevel 是 NSInteger）
+        let behavior: usize = CB_CAN_JOIN_ALL_SPACES | CB_FULLSCREEN_AUXILIARY | CB_STATIONARY;
+
+        unsafe {
+            let _: () = msg_send![ns, setCollectionBehavior: behavior];
+            // 托盘应用失活是常态，别因为失活就把窗口收走。msg_send! 会自动把 bool 转成 BOOL
+            let _: () = msg_send![ns, setHidesOnDeactivate: false];
+            if let Some(l) = level {
+                let _: () = msg_send![ns, setLevel: l];
+            }
+        }
+    }
 
     // 直接链系统框架，避免为权限检查引入额外 crate
     #[link(name = "ApplicationServices", kind = "framework")]
@@ -71,9 +123,25 @@ mod mac {
     }
 }
 
+/// 两把全局热键的注册结果。空串代表正常，非空是给用户看的原因。
+#[derive(Debug, Clone, Default, Serialize)]
+struct HotkeyStatus {
+    translate_err: String,
+    ask_err: String,
+}
+
+/// 当前生效的热键。handler 拿它来判断按下的是哪一把。
+#[derive(Default)]
+struct Hotkeys {
+    translate: Option<Shortcut>,
+    ask: Option<Shortcut>,
+    status: HotkeyStatus,
+}
+
 /// 全局运行期状态
 struct AppState {
     config: Mutex<config::Config>,
+    hotkeys: Mutex<Hotkeys>,
 }
 
 // ============ 自定义命令（前端 invoke 调用，v2 中自定义命令无需 ACL） ============
@@ -86,7 +154,7 @@ fn copy_text(text: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 隐藏调用它的窗口（浮窗、设置窗通用）
+/// 隐藏调用它的窗口（浮窗、问答窗、设置窗通用）
 #[tauri::command]
 fn hide_window(window: WebviewWindow) {
     let _ = window.hide();
@@ -155,6 +223,12 @@ fn open_settings(app: tauri::AppHandle) {
     show_settings(&app);
 }
 
+/// 热键注册结果，供设置界面提示「该组合被别人占了」
+#[tauri::command]
+fn hotkey_status(state: tauri::State<AppState>) -> HotkeyStatus {
+    state.hotkeys.lock().unwrap().status.clone()
+}
+
 /// 返回当前配置，供设置界面预填
 #[tauri::command]
 fn get_config(state: tauri::State<AppState>) -> config::Config {
@@ -168,6 +242,9 @@ struct SaveArgs {
     target_lang: String,
     base_url: String,
     hotkey: String,
+    ask_hotkey: String,
+    ask_include_selection: bool,
+    ask_thinking: bool,
 }
 
 /// 保存配置：写入 config.json、更新内存、动态重注册热键（无需重启）
@@ -179,10 +256,16 @@ fn save_config(
 ) -> Result<(), String> {
     let cfg = config::Config {
         api_key: args.api_key.trim().to_string(),
-        model: non_empty(&args.model, "deepseek-chat"),
-        target_lang: non_empty(&args.target_lang, "中文"),
-        base_url: non_empty(args.base_url.trim().trim_end_matches('/'), "https://api.deepseek.com"),
-        hotkey: non_empty(&args.hotkey, "Ctrl+Alt+T"),
+        model: non_empty(&args.model, config::DEFAULT_MODEL),
+        target_lang: non_empty(&args.target_lang, config::DEFAULT_TARGET_LANG),
+        base_url: non_empty(
+            args.base_url.trim().trim_end_matches('/'),
+            config::DEFAULT_BASE_URL,
+        ),
+        hotkey: non_empty(&args.hotkey, config::DEFAULT_HOTKEY),
+        ask_hotkey: non_empty(&args.ask_hotkey, config::DEFAULT_ASK_HOTKEY),
+        ask_include_selection: args.ask_include_selection,
+        ask_thinking: args.ask_thinking,
     };
 
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
@@ -191,7 +274,7 @@ fn save_config(
     std::fs::write(dir.join("config.json"), txt).map_err(|e| e.to_string())?;
 
     *state.config.lock().unwrap() = cfg.clone();
-    register_hotkey(&app, &cfg.hotkey);
+    register_hotkeys(&app, &cfg);
     Ok(())
 }
 
@@ -202,6 +285,54 @@ fn non_empty(v: &str, default: &str) -> String {
     } else {
         t.to_string()
     }
+}
+
+// ============ 问答 ============
+
+#[derive(Deserialize)]
+struct AskMsg {
+    role: String,
+    content: String,
+}
+
+/// 前端把整段对话历史传上来，这里直接转发 —— 多轮状态留在前端，Rust 侧无状态。
+#[tauri::command]
+fn ask_send(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    messages: Vec<AskMsg>,
+) -> Result<(), String> {
+    let cfg = state.config.lock().unwrap().clone();
+    if cfg.api_key.trim().is_empty() {
+        show_settings(&app);
+        return Err("还没有填 DeepSeek API Key，已为你打开设置。".into());
+    }
+    if messages.is_empty() {
+        return Err("没有内容可提问".into());
+    }
+
+    let mut msgs: Vec<Value> = vec![json!({"role": "system", "content": ASK_SYSTEM_PROMPT})];
+    msgs.extend(
+        messages
+            .into_iter()
+            .map(|m| json!({"role": m.role, "content": m.content})),
+    );
+
+    tauri::async_runtime::spawn(async move {
+        deepseek::chat_stream(
+            app,
+            deepseek::ChatRequest {
+                base_url: cfg.base_url,
+                api_key: cfg.api_key,
+                model: cfg.model,
+                messages: msgs,
+                thinking: cfg.ask_thinking,
+            },
+            &deepseek::ASK,
+        )
+        .await;
+    });
+    Ok(())
 }
 
 // ============ 取词：模拟复制快捷键并读取剪贴板（阻塞，放到 blocking 线程） ============
@@ -315,6 +446,66 @@ fn monitor_at(win: &WebviewWindow, x: f64, y: f64) -> Option<Monitor> {
         .or_else(|| win.current_monitor().ok().flatten())
 }
 
+/// 显示器可用区域，换算到光标坐标系，返回 (x, y, 宽, 高)。
+/// 某些平台可能给不出有效工作区，此时退回整块屏幕。
+fn work_area_of(m: &Monitor) -> (f64, f64, f64, f64) {
+    let k = px_per_unit(m.scale_factor());
+    let area = m.work_area();
+    if area.size.width > 0 && area.size.height > 0 {
+        (
+            area.position.x as f64 / k,
+            area.position.y as f64 / k,
+            area.size.width as f64 / k,
+            area.size.height as f64 / k,
+        )
+    } else {
+        let (p, s) = (m.position(), m.size());
+        (
+            p.x as f64 / k,
+            p.y as f64 / k,
+            s.width as f64 / k,
+            s.height as f64 / k,
+        )
+    }
+}
+
+/// 窗口尺寸换算到光标坐标系，返回 (宽, 高)。
+///
+/// `outer_size()` 是相对「窗口当前所在屏」的物理像素，必须用窗口自己的缩放比来换算。
+/// 用光标所在屏的缩放比，会在两块屏 DPI 不同时把尺寸算成一半或两倍，翻转/夹取就全错了。
+/// 拿不到实际尺寸时用 `fallback`（tauri.conf.json 里配的逻辑尺寸）兜底。
+fn window_size_in_cursor_units(
+    win: &WebviewWindow,
+    mon: Option<&Monitor>,
+    fallback: (f64, f64),
+) -> (f64, f64) {
+    let ws = win
+        .scale_factor()
+        .ok()
+        .or_else(|| mon.map(|m| m.scale_factor()))
+        .unwrap_or(1.0);
+    let wk = px_per_unit(ws);
+
+    // ws / wk 把逻辑单位换算到光标坐标系（macOS 恒为 1，Windows 上是缩放比）
+    let (mut w, mut h) = (fallback.0 * ws / wk, fallback.1 * ws / wk);
+    if let Ok(size) = win.outer_size() {
+        if size.width > 0 && size.height > 0 {
+            w = size.width as f64 / wk;
+            h = size.height as f64 / wk;
+        }
+    }
+    (w, h)
+}
+
+#[cfg(target_os = "macos")]
+fn move_window(win: &WebviewWindow, x: f64, y: f64) {
+    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+}
+#[cfg(not(target_os = "macos"))]
+fn move_window(win: &WebviewWindow, x: f64, y: f64) {
+    let _ = win.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+}
+
 /// 把浮窗摆在光标旁，并夹回所在显示器的工作区，避免在屏幕边缘被截断。
 fn place_popup_near_cursor(win: &WebviewWindow, cx: f64, cy: f64) {
     const OFF_X: f64 = 12.0;
@@ -322,49 +513,13 @@ fn place_popup_near_cursor(win: &WebviewWindow, cx: f64, cy: f64) {
     const GAP: f64 = 8.0;
 
     let mon = monitor_at(win, cx, cy);
-
-    // 窗口尺寸：outer_size() 是相对「窗口当前所在屏」的物理像素，必须用窗口自己的缩放比来换算。
-    // 用光标所在屏的缩放比，会在两块屏 DPI 不同时把尺寸算成一半或两倍，翻转/夹取就全错了。
-    let ws = win
-        .scale_factor()
-        .ok()
-        .or_else(|| mon.as_ref().map(|m| m.scale_factor()))
-        .unwrap_or(1.0);
-    let wk = px_per_unit(ws);
-
-    // 兜底值取自 tauri.conf.json 里 main 窗口的「逻辑」尺寸；
-    // ws / wk 把逻辑单位换算到光标坐标系（macOS 恒为 1，Windows 上是缩放比）。
-    let (mut w, mut h) = (420.0 * ws / wk, 340.0 * ws / wk);
-    if let Ok(size) = win.outer_size() {
-        if size.width > 0 && size.height > 0 {
-            w = size.width as f64 / wk;
-            h = size.height as f64 / wk;
-        }
-    }
+    let (w, h) = window_size_in_cursor_units(win, mon.as_ref(), (420.0, 340.0));
 
     let mut px = cx + OFF_X;
     let mut py = cy + OFF_Y;
 
     if let Some(m) = mon {
-        let mk = px_per_unit(m.scale_factor());
-        let area = m.work_area();
-        // 某些平台可能给不出有效工作区，此时退回整块屏幕
-        let (ax, ay, aw, ah) = if area.size.width > 0 && area.size.height > 0 {
-            (
-                area.position.x as f64 / mk,
-                area.position.y as f64 / mk,
-                area.size.width as f64 / mk,
-                area.size.height as f64 / mk,
-            )
-        } else {
-            let (p, s) = (m.position(), m.size());
-            (
-                p.x as f64 / mk,
-                p.y as f64 / mk,
-                s.width as f64 / mk,
-                s.height as f64 / mk,
-            )
-        };
+        let (ax, ay, aw, ah) = work_area_of(&m);
 
         // 右/下方放不下就翻到光标另一侧，再整体夹进工作区
         if px + w > ax + aw - GAP {
@@ -377,10 +532,28 @@ fn place_popup_near_cursor(win: &WebviewWindow, cx: f64, cy: f64) {
         py = py.clamp(ay + GAP, (ay + ah - h - GAP).max(ay + GAP));
     }
 
-    #[cfg(target_os = "macos")]
-    let _ = win.set_position(tauri::LogicalPosition::new(px, py));
-    #[cfg(not(target_os = "macos"))]
-    let _ = win.set_position(tauri::PhysicalPosition::new(px as i32, py as i32));
+    move_window(win, px, py);
+}
+
+/// 把问答窗摆在光标所在那块屏的中央偏上（Spotlight 那种观感）。
+fn place_ask_on_cursor_monitor(win: &WebviewWindow, cx: f64, cy: f64) {
+    let mon = monitor_at(win, cx, cy);
+    let (w, h) = window_size_in_cursor_units(win, mon.as_ref(), (640.0, 460.0));
+
+    let Some(m) = mon else {
+        move_window(win, cx - w / 2.0, cy - h / 2.0);
+        return;
+    };
+    let (ax, ay, aw, ah) = work_area_of(&m);
+    let px = ax + (aw - w) / 2.0;
+    // 垂直放在 1/3 处而不是正中：视线落点更自然，也给下方留出答案展开的余地
+    let py = ay + ((ah - h) / 3.0).max(0.0);
+
+    move_window(
+        win,
+        px.clamp(ax, (ax + aw - w).max(ax)),
+        py.clamp(ay, (ay + ah - h).max(ay)),
+    );
 }
 
 /// 在鼠标附近显示浮窗
@@ -391,6 +564,17 @@ fn show_popup(app: &tauri::AppHandle) {
         }
         // show 必须在 set_focus 之前：窗口不可见时 set_focus 是空操作，别调换顺序
         let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+fn show_ask(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("ask") {
+        if let Some((x, y)) = cursor_pos() {
+            place_ask_on_cursor_monitor(&win, x as f64, y as f64);
+        }
+        let _ = win.show();
+        let _ = win.unminimize();
         let _ = win.set_focus();
     }
 }
@@ -452,7 +636,7 @@ fn trigger_translate(app: &tauri::AppHandle) {
 
         let _ = app.emit(
             "tr://start",
-            serde_json::json!({
+            json!({
                 "source": text,
                 "target": cfg.target_lang,
                 "model": cfg.model,
@@ -468,6 +652,35 @@ fn trigger_translate(app: &tauri::AppHandle) {
             text,
         )
         .await;
+    });
+}
+
+// ============ 触发问答：可选取词 -> 弹窗 -> 等用户提问 ============
+
+fn trigger_ask(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let cfg = {
+            let state = app.state::<AppState>();
+            let guard = state.config.lock().unwrap();
+            guard.clone()
+        };
+
+        if cfg.api_key.trim().is_empty() {
+            show_settings(&app);
+            return;
+        }
+
+        // 取词失败（没选中、没授权）都不该拦住提问，静默降级成空引用即可
+        let mut quote = String::new();
+        if cfg.ask_include_selection {
+            if let Ok(Ok(t)) = tauri::async_runtime::spawn_blocking(grab_selection).await {
+                quote = t.trim().to_string();
+            }
+        }
+
+        show_ask(&app);
+        let _ = app.emit("ask://open", json!({ "quote": quote, "model": cfg.model }));
     });
 }
 
@@ -530,8 +743,8 @@ fn key_to_code(k: &str) -> Option<tauri_plugin_global_shortcut::Code> {
     Some(c)
 }
 
-fn parse_shortcut(s: &str) -> Option<tauri_plugin_global_shortcut::Shortcut> {
-    use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
+fn parse_shortcut(s: &str) -> Option<Shortcut> {
+    use tauri_plugin_global_shortcut::Modifiers;
     let mut mods = Modifiers::empty();
     let mut code = None;
     for part in s.split('+') {
@@ -546,20 +759,54 @@ fn parse_shortcut(s: &str) -> Option<tauri_plugin_global_shortcut::Shortcut> {
     code.map(|c| Shortcut::new(if mods.is_empty() { None } else { Some(mods) }, c))
 }
 
-/// 重新注册全局热键：先清空再注册当前配置的快捷键
-fn register_hotkey(app: &tauri::AppHandle, hotkey: &str) {
+/// 重新注册两把全局热键：先清空再按当前配置注册，并把失败原因留给设置界面。
+///
+/// 注册失败必须报出来 —— 系统级组合（比如 macOS 的 ⌘Space 被 Spotlight 占着）
+/// 会直接注册失败，静默吞掉的话用户只会觉得「按了没反应」，无从排查。
+fn register_hotkeys(app: &tauri::AppHandle, cfg: &config::Config) {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
-    if let Some(sc) = parse_shortcut(hotkey) {
-        let _ = gs.register(sc);
+
+    let mut hk = Hotkeys::default();
+
+    match parse_shortcut(&cfg.hotkey) {
+        None => hk.status.translate_err = format!("「{}」不是合法的快捷键写法", cfg.hotkey),
+        Some(sc) => match gs.register(sc) {
+            Ok(()) => hk.translate = Some(sc),
+            Err(e) => {
+                hk.status.translate_err =
+                    format!("「{}」注册失败，可能已被系统或其他软件占用：{e}", cfg.hotkey)
+            }
+        },
+    }
+
+    match parse_shortcut(&cfg.ask_hotkey) {
+        None => hk.status.ask_err = format!("「{}」不是合法的快捷键写法", cfg.ask_hotkey),
+        Some(sc) if hk.translate == Some(sc) => {
+            hk.status.ask_err = format!("「{}」和划词翻译的快捷键重复了", cfg.ask_hotkey)
+        }
+        Some(sc) => match gs.register(sc) {
+            Ok(()) => hk.ask = Some(sc),
+            Err(e) => {
+                hk.status.ask_err = format!(
+                    "「{}」注册失败，可能已被系统或其他软件占用：{e}",
+                    cfg.ask_hotkey
+                )
+            }
+        },
+    }
+
+    if let Some(state) = app.try_state::<AppState>() {
+        *state.hotkeys.lock().unwrap() = hk;
     }
 }
 
 fn reload_config(app: &tauri::AppHandle) {
     if let Ok(dir) = app.path().app_config_dir() {
         let cfg = config::Config::load(&dir);
-        register_hotkey(app, &cfg.hotkey);
+        register_hotkeys(app, &cfg);
         if let Some(state) = app.try_state::<AppState>() {
             *state.config.lock().unwrap() = cfg;
         }
@@ -581,6 +828,19 @@ fn tray_icon(app: &tauri::App) -> tauri::image::Image<'_> {
     app.default_window_icon().unwrap().clone()
 }
 
+/// macOS：让窗口能盖在别的 App 的全屏窗口上。其他平台空操作。
+///
+/// 必须在 setup 里（主线程）调用。
+#[allow(unused_variables)]
+fn setup_overlay(app: &tauri::App, label: &str, level_macos: Option<isize>) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(win) = app.get_webview_window(label) {
+            mac::make_overlay(&win, level_macos);
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -594,19 +854,28 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             let _ = mac::request_post_event_access();
 
+            // macOS：三个窗口都要能出现在别的 App 的全屏 Space 里，否则读全屏 PDF 时
+            // 按快捷键什么都看不到。层级各不相同：
+            //   浮窗小且瞬时，压过菜单栏无妨；问答窗常驻可读，浮动层就够；
+            //   设置窗是普通窗口，只加 Space 行为、不抬层级。
+            setup_overlay(app, "main", Some(LEVEL_STATUS));
+            setup_overlay(app, "ask", Some(LEVEL_FLOATING));
+            setup_overlay(app, "settings", None);
+
             // 载入配置
             let dir = app.path().app_config_dir()?;
             let cfg = config::Config::load(&dir);
-            let hotkey = cfg.hotkey.clone();
             // 缺 Key，或 macOS 上还没拿到辅助功能授权，都先把设置窗顶出来
             let need_settings = cfg.api_key.trim().is_empty() || !accessibility_ok();
+            let cfg_for_hotkeys = cfg.clone();
             app.manage(AppState {
                 config: Mutex::new(cfg),
+                hotkeys: Mutex::new(Hotkeys::default()),
             });
 
             // 托盘菜单
-            let settings_i =
-                MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
+            let ask_i = MenuItem::with_id(app, "ask", "问答窗口", true, None::<&str>)?;
+            let settings_i = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
             let open_dir_i =
                 MenuItem::with_id(app, "open_config", "打开配置目录", true, None::<&str>)?;
             let reload_i =
@@ -615,7 +884,7 @@ pub fn run() {
             let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
-                &[&settings_i, &open_dir_i, &reload_i, &sep, &quit_i],
+                &[&ask_i, &settings_i, &open_dir_i, &reload_i, &sep, &quit_i],
             )?;
             TrayIconBuilder::new()
                 .icon(tray_icon(app))
@@ -624,6 +893,10 @@ pub fn run() {
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => app.exit(0),
+                    "ask" => {
+                        show_ask(app);
+                        let _ = app.emit("ask://open", json!({ "quote": "" }));
+                    }
                     "settings" => show_settings(app),
                     "open_config" => {
                         let _ = open_config_dir(app.clone());
@@ -643,6 +916,18 @@ pub fn run() {
                 });
             }
 
+            // 问答窗：**刻意不做**失焦隐藏 —— 你多半要切回 PDF 对着答案看，
+            // 一失焦就消失反而添乱。只认 Esc 和关闭按钮，关闭时也只隐藏不销毁。
+            if let Some(aw) = app.get_webview_window("ask") {
+                let a2 = aw.clone();
+                aw.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = a2.hide();
+                    }
+                });
+            }
+
             // 设置窗：点关闭时只隐藏，不销毁（方便再次从托盘打开）
             if let Some(sw) = app.get_webview_window("settings") {
                 let s2 = sw.clone();
@@ -654,21 +939,32 @@ pub fn run() {
                 });
             }
 
-            // 全局快捷键：注册插件（Rust 侧，无需 ACL），触发即翻译
+            // 全局快捷键：注册插件（Rust 侧，无需 ACL），按下哪把就做哪件事
             #[cfg(desktop)]
             {
                 use tauri_plugin_global_shortcut::ShortcutState;
                 app.handle().plugin(
                     tauri_plugin_global_shortcut::Builder::new()
-                        .with_handler(move |app, _shortcut, event| {
-                            // 同一时刻只注册一个热键，触发即翻译
-                            if event.state() == ShortcutState::Pressed {
+                        .with_handler(move |app, shortcut, event| {
+                            if event.state() != ShortcutState::Pressed {
+                                return;
+                            }
+                            let (translate, ask) = match app.try_state::<AppState>() {
+                                Some(state) => {
+                                    let g = state.hotkeys.lock().unwrap();
+                                    (g.translate, g.ask)
+                                }
+                                None => (None, None),
+                            };
+                            if translate == Some(*shortcut) {
                                 trigger_translate(app);
+                            } else if ask == Some(*shortcut) {
+                                trigger_ask(app);
                             }
                         })
                         .build(),
                 )?;
-                register_hotkey(app.handle(), &hotkey);
+                register_hotkeys(app.handle(), &cfg_for_hotkeys);
             }
 
             // 首次启动无 Key：自动弹出设置窗
@@ -686,7 +982,9 @@ pub fn run() {
             get_config,
             save_config,
             platform_info,
-            open_accessibility_settings
+            open_accessibility_settings,
+            hotkey_status,
+            ask_send
         ])
         .run(tauri::generate_context!())
         .expect("启动 QuickTrans 失败");

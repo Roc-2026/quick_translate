@@ -28,6 +28,22 @@
         "center": false
       },
       {
+        "label": "ask",
+        "title": "QuickTrans 问答",
+        "width": 640,
+        "height": 460,
+        "minWidth": 420,
+        "minHeight": 300,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "shadow": false,
+        "center": true
+      },
+      {
         "label": "settings",
         "title": "QuickTrans 设置",
         "width": 480,

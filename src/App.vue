@@ -6,7 +6,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 const source = ref("");
 const translation = ref("");
 const target = ref("中文");
-const model = ref("deepseek-chat");
+const model = ref("deepseek-v4-flash");
 const loading = ref(false);
 const errorMsg = ref("");
 const copied = ref(false);
