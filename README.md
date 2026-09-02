@@ -35,6 +35,27 @@
 
 ---
 
+## 📥 直接下载（不想自己编译的话）
+
+到 **[Releases](https://github.com/Roc-2026/quick_translate/releases/latest)** 下载现成的安装包：
+
+| 平台 | 文件 |
+|------|------|
+| macOS（Apple Silicon） | `QuickTrans_x.y.z_aarch64.zip` |
+| Windows 10/11（64 位） | `QuickTrans_x.y.z_x64-setup.exe` |
+
+**macOS**：解压后把 `QuickTrans.app` 拖进「应用程序」，然后在终端里执行一次
+```bash
+xattr -dr com.apple.quarantine /Applications/QuickTrans.app
+```
+这一步不能跳 —— 没有 Apple 代码签名的 App 直接双击会提示「已损坏」，其实只是被打了「从网上下载」的隔离标记。
+
+**Windows**：双击 exe，SmartScreen 提示时点「更多信息 → 仍要运行」。
+
+Intel Mac、或者想改代码，往下看自行构建。
+
+---
+
 ## 🚀 快速开始（Windows）
 
 > ⚠️ **Windows 版必须在 Windows 上构建运行**。若你用 WSL/Linux 管理代码，请把项目放到 **Windows 本地盘**再构建——不要在 `\\wsl.localhost\...` 网络路径上跑，`cmd.exe` 不支持 UNC 工作目录。
@@ -165,8 +186,17 @@ bash mac-run.sh build
 
 产物在 `src-tauri/target/release/bundle/`：
 
+- `macos/QuickTrans.app` —— 可直接双击运行
 - `dmg/QuickTrans_x.y.z_<arch>.dmg` —— 拖进「应用程序」安装
-- `macos/QuickTrans.app` —— 也可直接双击运行
+
+> 💡 **要分发给别人，建议压缩 `.app` 而不是用 dmg。** `bundle_dmg.sh` 依赖 `hdiutil` 挂载临时卷加 `osascript` 驱动 Finder 摆图标，很容易因为残留的挂载卷或终端缺少「自动化 → Finder」权限而失败，而 dmg 除了拖拽动画外没有实际价值。
+>
+> ```bash
+> cd src-tauri/target/release/bundle/macos
+> ditto -c -k --keepParent QuickTrans.app QuickTrans_x.y.z_aarch64.zip
+> ```
+>
+> **必须用 `ditto`**，不能用右键压缩或 `zip -r` —— `.app` 里有符号链接和扩展属性，普通 zip 会破坏 bundle 结构，对方解压出来打不开。
 
 想出**同时支持 Intel 和 Apple Silicon** 的通用包：
 
@@ -249,6 +279,8 @@ macOS 上 `Alt` = `⌥ Option`，`Super`（也可写 `Cmd`）= `⌘ Command`，�
 
 **macOS**
 
+- **下载的 App 提示「已损坏，无法打开」**：不是真的损坏，是没做 Apple 代码签名。执行一次 `xattr -dr com.apple.quarantine /Applications/QuickTrans.app`，或右键 →「打开」→ 再点「打开」。
+- **打包 dmg 失败（`bundle_dmg.sh` 报错）**：`.app` 其实已经编译好了（在 `bundle/macos/` 下），失败的只是最后塞进 dmg 那步。两个常见原因：上次失败残留的卷还挂着（`hdiutil detach "/Volumes/QuickTrans" -force`），或终端缺少「自动化 → Finder」权限（系统设置 → 隐私与安全性 → 自动化，勾上你的终端下的 Finder；列表里没有就 `tccutil reset AppleEvents` 后重跑，弹窗时点「好」）。要分发的话直接 `ditto` 压 `.app` 更省事，见上面第 6 步。
 - **按快捷键提示「未授予辅助功能权限」**：见上面第 3 步。**重新编译后需要重新授权**。
 - **辅助功能列表里找不到 QuickTrans**：先确认你跑的是 `.app` 而不是 dev 模式 —— dev 的裸二进制在列表里显示成小写 `quicktrans`，或被算到父终端（Terminal / iTerm / VS Code）头上，勾那个父终端并**完全退出重开**（⌘Q）往往就能用。必须由 App 主动 `CGRequestPostEventAccess()` 才会注册进列表（启动时会自动调）。仍缺失就用 `tccutil reset PostEvent com.quicktrans.app`（dev 模式没有 bundle ID，用不带参数的全量重置）后重启 App；手动添加则在列表里点 `+`，用 `⌘⇧G` 输入可执行文件的完整路径（默认对话框只显示 `/Applications`）。
 - **译出来的永远是上一次复制的内容**：已修。两层成因：① 触发键 `⌃⌥T` 的修饰键用户还按着时，合成的 `⌘C` 会变成 `⌃⌥⌘C`，不是复制快捷键，系统什么都不做 —— 而 enigo 发 Release 事件**清不掉物理按键造成的 flags**，只能用 `CGEventSourceFlagsState()` 轮询真实状态等用户松手；② 原先固定 sleep 后无条件读剪贴板，**无法区分"复制成功"与"复制没生效"**，就把上次的残留当本次选中内容发出去了。现在发 `⌘C` 前先写入哨兵字符串，之后轮询，内容仍是哨兵即判定失败并报错（比对比文本可靠 —— 选中内容与上次复制相同时光比文本区分不了）。见 `lib.rs` 的 `grab_selection`。
