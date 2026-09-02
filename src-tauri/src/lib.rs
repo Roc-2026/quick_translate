@@ -90,6 +90,38 @@ mod mac {
         /// 请求该权限：首次调用会弹系统授权窗，并把本 App 写进辅助功能列表。
         /// 返回值只反映"当前是否已授权"，用户当场勾选后本次进程内一般不会变 true。
         fn CGRequestPostEventAccess() -> u8;
+        /// 当前修饰键的真实状态（CoreGraphics，含在 ApplicationServices 伞下）。
+        /// 返回 `CGEventFlags`(uint64)；参数 `CGEventSourceStateID`(int32) 传 0 =
+        /// `kCGEventSourceStateCombinedSessionState`，即"物理键盘 + 合成事件"的合并状态。
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    }
+
+    // CGEventFlags 里各修饰键的位（CGEventTypes.h）
+    const FLAG_SHIFT: u64 = 0x0002_0000;
+    const FLAG_CONTROL: u64 = 0x0004_0000;
+    const FLAG_ALTERNATE: u64 = 0x0008_0000;
+    const FLAG_COMMAND: u64 = 0x0010_0000;
+
+    /// 阻塞等到用户把热键的修饰键真正松开为止；超时返回 false。
+    ///
+    /// 这是「翻译出上一次复制内容」那个 bug 的根因所在：触发键是 ⌃⌥T，
+    /// 我们随后合成 ⌘C 时用户手指往往还压着 ⌃⌥，系统收到的是 ⌃⌥⌘C ——
+    /// 不是复制快捷键，什么都不会发生，剪贴板原封不动。
+    ///
+    /// 靠 enigo 发 Release 事件清不掉这个状态：合成事件影响不了物理按键的 flags，
+    /// 只能等用户自己松手。
+    pub fn wait_modifiers_released(timeout: std::time::Duration) -> bool {
+        const MASK: u64 = FLAG_SHIFT | FLAG_CONTROL | FLAG_ALTERNATE | FLAG_COMMAND;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if unsafe { CGEventSourceFlagsState(0) } & MASK == 0 {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
     }
 
     /// 进程是否能发出合成按键。未授权时 enigo 合成的按键会被系统静默丢弃，
@@ -361,16 +393,41 @@ fn grab_selection() -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     let release_mods: &[Key] = &[Key::Alt, Key::Shift, Key::Control];
 
-    // macOS 合成事件的投递与剪贴板回写都比 Windows 慢，等待时间相应放宽
+    // macOS：合成事件投递与剪贴板回写都比 Windows 慢，`wait` 是轮询上限（命中即走，
+    // 通常几十毫秒），所以可以给得宽松些；`settle` 反而能缩短 —— 等修饰键松开这件事
+    // 已经由 wait_modifiers_released 精确处理，不再需要盲等。
     #[cfg(target_os = "macos")]
-    let (settle, wait) = (Duration::from_millis(180), Duration::from_millis(220));
+    let (settle, wait) = (Duration::from_millis(60), Duration::from_millis(800));
     #[cfg(not(target_os = "macos"))]
-    let (settle, wait) = (Duration::from_millis(120), Duration::from_millis(140));
+    let (settle, wait) = (Duration::from_millis(120), Duration::from_millis(600));
 
     let mut cb = Clipboard::new().map_err(|e| e.to_string())?;
     let backup = cb.get_text().ok();
 
-    // 等用户松开触发组合键，避免修饰键干扰
+    // macOS：等用户真正松开 ⌃⌥ 等修饰键。
+    // 不等的话我们合成的 ⌘C 会变成 ⌃⌥⌘C —— 不是复制快捷键，系统什么都不做，
+    // 剪贴板停在上一次复制的内容上，于是"翻译出来的永远是之前复制的东西"。
+    #[cfg(target_os = "macos")]
+    {
+        if !mac::wait_modifiers_released(Duration::from_millis(1500)) {
+            return Err("请松开快捷键的修饰键（Control / Option 等）后再试 —— \
+按住不放时系统会把复制指令当成别的组合键。"
+                .to_string());
+        }
+    }
+
+    // 先往剪贴板写一个哨兵值，作为"这次复制到底有没有发生"的判据。
+    //
+    // 不这么做就无法区分「⌘C 生效但内容与上次相同」和「⌘C 根本没生效」：
+    // 后者剪贴板原封不动，读回来的是上一次复制的残留，会被当成本次选中的文本
+    // 发去翻译 —— 也就是"无论选什么，译出来的都是之前复制过的内容"。
+    //
+    // 哨兵取一个正常选中绝不会产生的私有区字符；万一取词失败，finally 段会把
+    // 用户原本的剪贴板还原回去，哨兵不会泄漏出去。
+    const SENTINEL: &str = "\u{f8ff}\u{200b}QuickTrans\u{200b}\u{f8ff}";
+    let sentinel_set = cb.set_text(SENTINEL.to_string()).is_ok();
+
+    // 给前台 App 一点时间把焦点/选区稳定下来
     std::thread::sleep(settle);
 
     let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
@@ -396,13 +453,41 @@ fn grab_selection() -> Result<String, String> {
         .key(copy_mod, Direction::Release)
         .map_err(|e| e.to_string())?;
 
-    // 等系统把选区写入剪贴板
-    std::thread::sleep(wait);
-    let text = cb.get_text().unwrap_or_default();
+    // 轮询等剪贴板被写入，而不是固定 sleep：命中即走，快得多；
+    // 迟迟等不到也能确切知道"这次没取到词"，而不是拿旧内容顶上。
+    let deadline = std::time::Instant::now() + wait;
+    let mut text = String::new();
+    let mut copied = false;
+    loop {
+        match cb.get_text() {
+            // 还是哨兵 => 复制尚未发生，继续等
+            Ok(t) if sentinel_set && t == SENTINEL => {}
+            Ok(t) => {
+                text = t;
+                copied = true;
+                break;
+            }
+            // 取词那一瞬间剪贴板可能正被清空（先 clear 再 set），读失败属正常，继续等
+            Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
 
-    // 还原用户原有剪贴板内容
+    // 还原用户原有剪贴板内容。哨兵写进去了就一定要还原，哪怕后面走的是错误分支。
     if let Some(b) = backup {
         let _ = cb.set_text(b);
+    } else if sentinel_set {
+        // 原本就是空的/非文本，至少别把哨兵留在那儿
+        let _ = cb.set_text(String::new());
+    }
+
+    if sentinel_set && !copied {
+        return Err("没有取到选中的文本 —— 当前可能没有选中内容，\
+或这个程序不响应复制指令（部分游戏、受保护的 PDF）。"
+            .to_string());
     }
 
     Ok(text)
