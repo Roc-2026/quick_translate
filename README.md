@@ -102,10 +102,24 @@ macOS 用系统自带的 WKWebView，**不需要**像 Windows 那样装 WebView2
 ```bash
 git clone https://github.com/Roc-2026/quick_translate.git
 cd quick_translate
-bash mac-run.sh        # = npm install && npm run tauri dev
+bash mac-run.sh build      # 打包成 .app
+cp -R src-tauri/target/release/bundle/macos/QuickTrans.app /Applications/
+open /Applications/QuickTrans.app
 ```
 
-启动后**看菜单栏右上角**的「译」图标（单色 template 图，会跟随浅色/深色菜单栏自动反色）。按设计**不会**在 Dock 里出现图标，也不进 `⌘Tab` 切换列表。
+首次 Rust 构建很慢，**十几分钟属正常**。
+
+> 💡 **日常使用请打包成 `.app`，不要用 `bash mac-run.sh`（dev 模式）。**
+>
+> dev 模式跑的是裸二进制 `src-tauri/target/debug/quicktrans`，没有 bundle ID，
+> 在「辅助功能」列表里**不叫 QuickTrans** —— 显示成小写的 `quicktrans`，
+> 或者干脆被算到父终端（Terminal / iTerm / VS Code）头上，很难找。
+> 而且每次重新编译授权就失效。
+>
+> `.app` 带 `com.quicktrans.app` 这个 bundle ID，授权窗会正常弹、名字正常显示，
+> 只要不重新编译就一直有效。改代码时才用 `bash mac-run.sh` 跑 dev。
+
+启动后**看菜单栏右上角**的「译」图标（单色 template 图，会跟随浅色/深色菜单栏自动反色）。按设计**不会**在 Dock 里出现图标，也不进 `⌘Tab` 切换列表 —— 找不到窗口是正常的。
 
 ### 3. 授予「辅助功能」权限 ← 必做
 
@@ -121,7 +135,13 @@ App 一启动就会调 `CGRequestPostEventAccess()` 主动请求，所以：
 
 > 严格来说发合成按键要的是 **PostEvent** 权限，与 Accessibility 是两个独立的 TCC 条目，只是都显示在「辅助功能」面板下。必须**主动 request 才会把 App 注册进那个列表** —— 只做 `AXIsProcessTrusted()` 之类的查询不会注册，列表里就一直看不到 QuickTrans。
 
-> ⚠️ **每次重新编译，二进制变了，授权就会失效**，需要在列表里删掉旧条目重新勾选。开发阶段这个很烦但绕不开 —— 除非用固定的开发者证书签名。
+> ⚠️ **每次重新编译，二进制变了，授权就会失效**，需要在列表里**用减号删掉旧条目**再重新勾选（光是关掉再打开开关没用）。这也是日常用 `.app`、只在改代码时才跑 dev 的另一个理由。
+>
+> 卡死时可以重置授权记录后重启 App：
+> ```bash
+> tccutil reset PostEvent com.quicktrans.app    # 针对 .app
+> tccutil reset PostEvent                        # dev 模式的裸二进制没有 bundle ID，只能全量重置
+> ```
 
 ### 4. 配置 Key + 使用
 
@@ -129,10 +149,18 @@ App 一启动就会调 `CGRequestPostEventAccess()` 主动请求，所以：
 
 > `Cmd+B` 是全局抢占的，注册之后各家编辑器里的「加粗」都会失效。嫌碍事就去设置里改成 `Cmd+Shift+B` 之类。`⌘Space` 被 Spotlight 占着，填了会注册失败（设置界面会给出告警）。
 
-### 5. 打包
+### 5. 改代码时（dev 模式）
 
 ```bash
-bash mac-run.sh build      # = npm run tauri build
+bash mac-run.sh            # = npm install && npm run tauri dev
+```
+
+前端改动热更新；Rust 改动会重新编译。注意上面提过的两个 dev 模式限制：辅助功能列表里显示为小写 `quicktrans`（或归到父终端名下），且每次重编译都要重新授权。
+
+### 6. 出分发包
+
+```bash
+bash mac-run.sh build
 ```
 
 产物在 `src-tauri/target/release/bundle/`：
@@ -206,7 +234,8 @@ macOS 上 `Alt` = `⌥ Option`，`Super`（也可写 `Cmd`）= `⌘ Command`，�
 
 **通用**
 
-- **提示"没有选中文本"**：个别程序（部分游戏、受保护 PDF）不响应模拟复制；换个软件或先手动确认能复制。
+- **提示"没有取到选中的文本"**：当前确实没选中，或这个程序不响应模拟复制（部分游戏、受保护 PDF）。换个软件，或先手动 `Ctrl+C` / `⌘C` 确认能复制。
+- **译出来的是之前复制过的内容，不是这次选中的**：已修（见下面 macOS 一节）。若在旧版本上遇到，升级即可。
 - **热键没反应**：可能与其它软件全局热键冲突，去设置里换一个。注册失败时设置界面会直接给出黄色告警，不用猜。
 - **按了 `Cmd+B` 之后各种编辑器不能加粗了**：这是全局热键的固有代价 —— 系统级抢占，所有 App 都收不到这个组合了。去设置里换成 `Cmd+Shift+B` 之类即可。macOS 上 `⌘Space` 被 Spotlight 占着，填了会注册失败。
 - **一直转圈 / 401**：`api_key` 没填对或未充值。
@@ -221,7 +250,8 @@ macOS 上 `Alt` = `⌥ Option`，`Super`（也可写 `Cmd`）= `⌘ Command`，�
 **macOS**
 
 - **按快捷键提示「未授予辅助功能权限」**：见上面第 3 步。**重新编译后需要重新授权**。
-- **辅助功能列表里找不到 QuickTrans**：必须由 App 主动 `CGRequestPostEventAccess()` 才会注册进去（启动时会自动调）。若仍缺失，可用 `tccutil reset PostEvent com.quicktrans.app` 重置后重启 App 再试；手动添加则在列表里点 `+`，用 `⌘⇧G` 输入 `.app` 内可执行文件的完整路径（默认对话框只显示 `/Applications`）。
+- **辅助功能列表里找不到 QuickTrans**：先确认你跑的是 `.app` 而不是 dev 模式 —— dev 的裸二进制在列表里显示成小写 `quicktrans`，或被算到父终端（Terminal / iTerm / VS Code）头上，勾那个父终端并**完全退出重开**（⌘Q）往往就能用。必须由 App 主动 `CGRequestPostEventAccess()` 才会注册进列表（启动时会自动调）。仍缺失就用 `tccutil reset PostEvent com.quicktrans.app`（dev 模式没有 bundle ID，用不带参数的全量重置）后重启 App；手动添加则在列表里点 `+`，用 `⌘⇧G` 输入可执行文件的完整路径（默认对话框只显示 `/Applications`）。
+- **译出来的永远是上一次复制的内容**：已修。两层成因：① 触发键 `⌃⌥T` 的修饰键用户还按着时，合成的 `⌘C` 会变成 `⌃⌥⌘C`，不是复制快捷键，系统什么都不做 —— 而 enigo 发 Release 事件**清不掉物理按键造成的 flags**，只能用 `CGEventSourceFlagsState()` 轮询真实状态等用户松手；② 原先固定 sleep 后无条件读剪贴板，**无法区分"复制成功"与"复制没生效"**，就把上次的残留当本次选中内容发出去了。现在发 `⌘C` 前先写入哨兵字符串，之后轮询，内容仍是哨兵即判定失败并报错（比对比文本可靠 —— 选中内容与上次复制相同时光比文本区分不了）。见 `lib.rs` 的 `grab_selection`。
 - **按快捷键后 App 直接崩溃（`EXC_BREAKPOINT` / `SIGTRAP`）**：已修。成因是 enigo 的 `Key::Unicode` 会反查键盘布局，那条路径调的 Carbon `TISGetInputSourceProperty` 带主线程断言，而取词跑在 tokio blocking 线程上。现在改成直接发 `⌘C` 的 virtual keycode，不再反查。
 - **浮窗是不透明黑块，没有毛玻璃**：`tauri.conf.json` 里的 `app.macOSPrivateApi` 必须为 `true`，且 `Cargo.toml` 里 tauri 要开 `macos-private-api` feature —— 两者缺一不可。
 - **菜单栏图标是彩色的、很脏**：`src-tauri/icons/tray-mac.png` 应该是纯黑字形 + 透明背景的 template 图；重新跑 `python3 gen_icons.py` 生成。
