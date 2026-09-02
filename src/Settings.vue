@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { computed, ref, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
 interface Config {
@@ -8,6 +8,9 @@ interface Config {
   target_lang: string;
   base_url: string;
   hotkey: string;
+  ask_hotkey: string;
+  ask_include_selection: boolean;
+  ask_thinking: boolean;
 }
 
 interface PlatformInfo {
@@ -15,11 +18,20 @@ interface PlatformInfo {
   accessibility_ok: boolean;
 }
 
+/** 两把全局热键的注册结果，空串代表正常 */
+interface HotkeyStatus {
+  translate_err: string;
+  ask_err: string;
+}
+
 const api_key = ref("");
-const model = ref("deepseek-chat");
+const model = ref("deepseek-v4-flash");
 const target_lang = ref("中文");
 const base_url = ref("https://api.deepseek.com");
 const hotkey = ref("Ctrl+Alt+T");
+const ask_hotkey = ref("Cmd+B");
+const ask_include_selection = ref(true);
+const ask_thinking = ref(false);
 
 const showKey = ref(false);
 const saving = ref(false);
@@ -29,8 +41,23 @@ const errorMsg = ref("");
 const isMac = ref(false);
 const axOk = ref(true);
 const axChecking = ref(false);
+const hk = ref<HotkeyStatus>({ translate_err: "", ask_err: "" });
 
 const LANGS = ["中文", "English", "日本語", "한국어", "Français", "Deutsch"];
+
+// DeepSeek 现在只有这两个模型；deepseek-chat / deepseek-reasoner 已于 2026-07-24 下线
+const MODELS = [
+  { id: "deepseek-v4-flash", desc: "快、便宜。翻译和日常问答用它就够" },
+  { id: "deepseek-v4-pro", desc: "推理更强，复杂问题更稳，价格约 3 倍" },
+];
+
+/** 下拉框选中项。不在预设里就落到「自定义」，让下面的输入框接管 */
+const modelPreset = computed({
+  get: () => (MODELS.some((m) => m.id === model.value) ? model.value : "custom"),
+  set: (v: string) => {
+    model.value = v === "custom" ? "" : v;
+  },
+});
 
 async function refreshPlatform() {
   try {
@@ -39,6 +66,14 @@ async function refreshPlatform() {
     axOk.value = p.accessibility_ok;
   } catch {
     // 拿不到就当无需授权，不打扰用户
+  }
+}
+
+async function refreshHotkeys() {
+  try {
+    hk.value = await invoke<HotkeyStatus>("hotkey_status");
+  } catch {
+    // 同上，读不到就不提示
   }
 }
 
@@ -58,13 +93,17 @@ onMounted(async () => {
   try {
     const c = await invoke<Config>("get_config");
     api_key.value = c.api_key ?? "";
-    model.value = c.model || "deepseek-chat";
+    model.value = c.model || "deepseek-v4-flash";
     target_lang.value = c.target_lang || "中文";
     base_url.value = c.base_url || "https://api.deepseek.com";
     hotkey.value = c.hotkey || "Ctrl+Alt+T";
+    ask_hotkey.value = c.ask_hotkey || (isMac.value ? "Cmd+B" : "Ctrl+Alt+B");
+    ask_include_selection.value = c.ask_include_selection ?? true;
+    ask_thinking.value = c.ask_thinking ?? false;
   } catch (e) {
     errorMsg.value = String(e);
   }
+  await refreshHotkeys();
 });
 
 async function save(closeAfter: boolean) {
@@ -79,10 +118,15 @@ async function save(closeAfter: boolean) {
         target_lang: target_lang.value,
         base_url: base_url.value,
         hotkey: hotkey.value,
+        ask_hotkey: ask_hotkey.value,
+        ask_include_selection: ask_include_selection.value,
+        ask_thinking: ask_thinking.value,
       },
     });
+    // 保存会重注册热键，注册成没成得回读一次才知道
+    await refreshHotkeys();
     saved.value = true;
-    if (closeAfter) {
+    if (closeAfter && !hk.value.translate_err && !hk.value.ask_err) {
       await invoke("hide_window");
     } else {
       setTimeout(() => (saved.value = false), 1500);
@@ -156,8 +200,9 @@ async function save(closeAfter: boolean) {
     </label>
 
     <label class="field">
-      <span class="lab">全局快捷键</span>
+      <span class="lab">划词翻译快捷键</span>
       <input v-model="hotkey" placeholder="Ctrl+Alt+T" spellcheck="false" />
+      <span v-if="hk.translate_err" class="warn">⚠ {{ hk.translate_err }}</span>
       <span v-if="isMac" class="tip">
         格式如 <code>Ctrl+Alt+T</code>、<code>Cmd+Shift+E</code>。修饰键
         Ctrl（⌃）/ Alt（⌥ Option）/ Shift（⇧）/ Cmd（⌘），主键 a-z、0-9、F1-F12、Space。
@@ -168,11 +213,60 @@ async function save(closeAfter: boolean) {
       </span>
     </label>
 
+    <label class="field">
+      <span class="lab">问答窗快捷键</span>
+      <input v-model="ask_hotkey" placeholder="Cmd+B" spellcheck="false" />
+      <span v-if="hk.ask_err" class="warn">⚠ {{ hk.ask_err }}</span>
+      <span class="tip">
+        全局快捷键是系统级抢占的：注册
+        <code>{{ isMac ? "Cmd+B" : "Ctrl+B" }}</code>
+        之后，所有 App 里的「加粗」都会失效。嫌碍事就换成
+        <code>{{ isMac ? "Cmd+Shift+B" : "Ctrl+Alt+B" }}</code>。
+        <template v-if="isMac">
+          <br />⌘Space 被 Spotlight 占着，填了会注册失败。
+        </template>
+      </span>
+    </label>
+
+    <label class="check">
+      <input type="checkbox" v-model="ask_include_selection" />
+      <span>
+        唤起问答窗时带上选中的文本
+        <em>关掉可以秒开，开着会多花约 0.4 秒取词</em>
+      </span>
+    </label>
+
     <details class="adv">
       <summary>高级</summary>
       <label class="field">
         <span class="lab">模型</span>
-        <input v-model="model" placeholder="deepseek-chat" spellcheck="false" />
+        <select v-model="modelPreset">
+          <option v-for="m in MODELS" :key="m.id" :value="m.id">{{ m.id }}</option>
+          <option value="custom">自定义…</option>
+        </select>
+        <input
+          v-if="modelPreset === 'custom'"
+          v-model="model"
+          class="mt"
+          placeholder="deepseek-v4-flash"
+          spellcheck="false"
+        />
+        <span class="tip">
+          <template v-for="m in MODELS" :key="m.id">
+            <template v-if="m.id === modelPreset">{{ m.desc }}</template>
+          </template>
+          <template v-if="modelPreset === 'custom'">
+            自定义模型名。注意 <code>deepseek-chat</code> 与
+            <code>deepseek-reasoner</code> 已于 2026-07-24 下线，填了会直接报错。
+          </template>
+        </span>
+      </label>
+      <label class="check">
+        <input type="checkbox" v-model="ask_thinking" />
+        <span>
+          问答开启思考模式
+          <em>回答更靠谱，但首字要等好几秒。翻译始终不用思考模式</em>
+        </span>
       </label>
       <label class="field">
         <span class="lab">接口地址</span>
@@ -277,7 +371,8 @@ h1 {
   margin-left: 4px;
 }
 
-input {
+input,
+select {
   width: 100%;
   box-sizing: border-box;
   padding: 9px 11px;
@@ -290,8 +385,12 @@ input {
   user-select: text;
   transition: border-color 0.15s;
 }
-input:focus {
+input:focus,
+select:focus {
   border-color: #6366f1;
+}
+.mt {
+  margin-top: 8px;
 }
 
 .key-row {
@@ -300,6 +399,31 @@ input:focus {
 }
 .key-row input {
   flex: 1;
+}
+
+/* 复选框那一行：勾选框不能被上面的 width:100% 撑满 */
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-bottom: 16px;
+  font-size: 12px;
+  color: #c3c7d0;
+  cursor: pointer;
+  line-height: 1.5;
+}
+.check input[type="checkbox"] {
+  width: auto;
+  flex: none;
+  margin-top: 2px;
+  accent-color: #6366f1;
+}
+.check em {
+  display: block;
+  margin-top: 3px;
+  font-style: normal;
+  font-size: 11px;
+  color: #767b85;
 }
 
 .tip {
@@ -311,6 +435,13 @@ input:focus {
 }
 .tip a {
   color: #7c9cff;
+}
+.warn {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #f59e0b;
 }
 code {
   background: rgba(255, 255, 255, 0.08);

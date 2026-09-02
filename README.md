@@ -1,18 +1,21 @@
-# QuickTrans · 划词翻译（DeepSeek）
+# QuickTrans · 划词翻译 + 快捷问答（DeepSeek）
 
 选中任意软件里的文本 → 按快捷键 → 鼠标旁弹出浮窗，用 **DeepSeek** 逐字流式翻译。
+再按一下问答快捷键，就地追问刚选中的那段内容。
 
 一个常驻托盘 / 菜单栏的轻量工具，基于 **Tauri v2 + Rust + Vue 3**，产物是单个原生可执行文件，内存占用很小。**支持 Windows 与 macOS**。
 
-> 选中即翻译、流式输出、可视化设置（填 Key / 改快捷键 / 换目标语言）、原剪贴板自动还原。
+> 选中即翻译、流式输出、多轮问答、可视化设置（填 Key / 改快捷键 / 换目标语言）、原剪贴板自动还原。
 
 ---
 
 ## ✨ 特性
 
 - **划词翻译**：任意程序里选中文字，按快捷键（默认 `Ctrl+Alt+T`，macOS 上即 `⌃ Control + ⌥ Option + T`）即时翻译。
-- **流式输出**：译文逐字蹦出，不用干等。
+- **快捷问答**：按 `Cmd+B`（Windows 上 `Ctrl+Alt+B`）唤起问答窗，选中的文本自动带进去当上下文，可以连续追问。
+- **流式输出**：译文和回答都逐字蹦出，不用干等。
 - **精致浮窗**：毛玻璃暗色 UI，出现在鼠标旁，失焦自动隐藏，`Esc` 关闭；多屏 / 屏幕边缘会自动避让。
+- **盖得住全屏应用**（macOS）：别的 App 在原生全屏（比如全屏读 PDF）时，浮窗和问答窗照样能就地弹出，不会把你踢回另一个 Space。
 - **可视化设置**：托盘菜单里图形化填写 API Key、目标语言、快捷键，保存即时生效、无需重启。
 - **不打扰剪贴板**：取词时会备份并还原你原有的剪贴板内容。
 - **省心**：常驻托盘（macOS 上是菜单栏，且不占 Dock），原生 Rust，资源占用低。
@@ -24,9 +27,9 @@
 | 层 | 用到的东西 |
 |----|-----------|
 | 框架 | Tauri v2 |
-| 后端 | Rust：`global-shortcut`(全局热键) · `enigo`(模拟 Ctrl+C / ⌘C) · `arboard`(剪贴板) · `reqwest`(流式请求) |
+| 后端 | Rust：`global-shortcut`(全局热键) · `enigo`(模拟 Ctrl+C / ⌘C) · `arboard`(剪贴板) · `reqwest`(流式请求) · `objc2`(macOS 全屏浮窗) |
 | 前端 | Vue 3 + TypeScript + Vite |
-| 翻译 | DeepSeek `chat/completions`（OpenAI 兼容接口，流式） |
+| 模型 | DeepSeek `chat/completions`（OpenAI 兼容接口，流式），默认 `deepseek-v4-flash` |
 
 平台差异（全局热键、剪贴板、托盘、坐标系）都在同一份代码里用 `#[cfg(target_os = ...)]` 分支处理，没有分叉的第二套代码。
 
@@ -72,6 +75,7 @@ npm run tauri dev
 ### 5. 使用
 
 任意软件里选中文字 → 按 `Ctrl+Alt+T` → 浮窗出译文。
+想追问就按 `Ctrl+Alt+B` → 问答窗弹出，选中的那段已经在引用条里，直接提问即可。
 
 ---
 
@@ -121,7 +125,9 @@ App 一启动就会调 `CGRequestPostEventAccess()` 主动请求，所以：
 
 ### 4. 配置 Key + 使用
 
-和 Windows 一样：菜单栏图标 →「设置」填 API Key。然后任意软件里选中文字 → 按 `Ctrl+Alt+T`（即 `⌃⌥T`）→ 浮窗出译文。
+和 Windows 一样：菜单栏图标 →「设置」填 API Key。然后任意软件里选中文字 → 按 `Ctrl+Alt+T`（即 `⌃⌥T`）→ 浮窗出译文；按 `Cmd+B` → 问答窗弹出，选中的那段已在引用条里，直接追问。
+
+> `Cmd+B` 是全局抢占的，注册之后各家编辑器里的「加粗」都会失效。嫌碍事就去设置里改成 `Cmd+Shift+B` 之类。`⌘Space` 被 Spotlight 占着，填了会注册失败（设置界面会给出告警）。
 
 ### 5. 打包
 
@@ -178,14 +184,21 @@ macOS 的打包见上面「快速开始（macOS）」第 5 步。
 | 字段 | 含义 | 默认 |
 |------|------|------|
 | `api_key` | DeepSeek API Key | （必填） |
-| `model` | 模型 | `deepseek-chat` |
+| `model` | 模型，只能是 `deepseek-v4-flash` 或 `deepseek-v4-pro` | `deepseek-v4-flash` |
 | `target_lang` | 目标语言 | `中文` |
 | `base_url` | 接口地址 | `https://api.deepseek.com` |
-| `hotkey` | 全局快捷键 | `Ctrl+Alt+T` |
+| `hotkey` | 划词翻译快捷键 | `Ctrl+Alt+T` |
+| `ask_hotkey` | 问答窗快捷键 | macOS `Cmd+B`；其他平台 `Ctrl+Alt+B` |
+| `ask_include_selection` | 唤起问答窗时是否顺带取词做上下文 | `true` |
+| `ask_thinking` | 问答是否开启思考模式（更聪明但首字慢好几秒） | `false` |
 
 快捷键格式：修饰键 `Ctrl` / `Alt` / `Shift` / `Super` + 主键 `a-z` / `0-9` / `F1-F12` / `Space`，如 `Ctrl+Alt+T`、`Alt+F2`。
 macOS 上 `Alt` = `⌥ Option`，`Super`（也可写 `Cmd`）= `⌘ Command`，例如 `Cmd+Shift+E`。
 也可用环境变量 `DEEPSEEK_API_KEY` 覆盖 `api_key`。
+
+> **关于模型**：DeepSeek 已于 2026-07-24 下线 `deepseek-chat` 和 `deepseek-reasoner`，再用这两个名字请求会直接报错。
+> 旧版本留下的 `config.json` 在启动时会**自动迁移**到 `deepseek-v4-flash`，不用手动改。
+> V4 的**思考模式默认是开的**，翻译路径固定关掉（否则首字要等好几秒，且 `temperature` 会被静默忽略），问答路径由 `ask_thinking` 控制。
 
 ---
 
@@ -194,8 +207,11 @@ macOS 上 `Alt` = `⌥ Option`，`Super`（也可写 `Cmd`）= `⌘ Command`，�
 **通用**
 
 - **提示"没有选中文本"**：个别程序（部分游戏、受保护 PDF）不响应模拟复制；换个软件或先手动确认能复制。
-- **热键没反应**：可能与其它软件全局热键冲突，去设置里换一个。
+- **热键没反应**：可能与其它软件全局热键冲突，去设置里换一个。注册失败时设置界面会直接给出黄色告警，不用猜。
+- **按了 `Cmd+B` 之后各种编辑器不能加粗了**：这是全局热键的固有代价 —— 系统级抢占，所有 App 都收不到这个组合了。去设置里换成 `Cmd+Shift+B` 之类即可。macOS 上 `⌘Space` 被 Spotlight 占着，填了会注册失败。
 - **一直转圈 / 401**：`api_key` 没填对或未充值。
+- **报「Model Not Exist」**：`deepseek-chat` / `deepseek-reasoner` 已于 2026-07-24 下线。设置 → 高级 → 模型，换成 `deepseek-v4-flash`。
+- **回答要停顿好几秒才出字**：思考模式开着。设置 → 高级，关掉「问答开启思考模式」。
 - **`enigo` 编译报错**：如版本 API 变动，调整 `src-tauri/Cargo.toml` 里的 `enigo` 版本并按其文档微调取词逻辑。
 
 **Windows**
@@ -210,6 +226,7 @@ macOS 上 `Alt` = `⌥ Option`，`Super`（也可写 `Cmd`）= `⌘ Command`，�
 - **浮窗是不透明黑块，没有毛玻璃**：`tauri.conf.json` 里的 `app.macOSPrivateApi` 必须为 `true`，且 `Cargo.toml` 里 tauri 要开 `macos-private-api` feature —— 两者缺一不可。
 - **菜单栏图标是彩色的、很脏**：`src-tauri/icons/tray-mac.png` 应该是纯黑字形 + 透明背景的 template 图；重新跑 `python3 gen_icons.py` 生成。
 - **打包报找不到 `icon.icns`**：跑 `python3 gen_icons.py`（纯 Python 生成，不依赖 macOS 的 `iconutil`），或用 `npx tauri icon src-tauri/icons/icon.png`。
+- **别的 App 全屏时按快捷键没反应**（比如全屏读 PDF）：已修。macOS 的原生全屏会把那个 App 放进独立的 Space，普通窗口不属于该 Space，`show()` 的结果是系统把你切回 QuickTrans 自己的 Space 再显示，看起来就像没反应。现在三个窗口在启动时都会被设上 `NSWindowCollectionBehaviorCanJoinAllSpaces | FullScreenAuxiliary`（见 `lib.rs` 的 `mac::make_overlay`）——**这两位缺一不可**，tao 的 `set_visible_on_all_workspaces()` 只设了前者，所以没法直接用。
 - **浮窗弹出时源程序失去焦点**：目前是普通窗口，show 时会抢焦点（与 Windows 版行为一致）。要做到完全不抢需要换成非激活的 `NSPanel`（`tauri-nspanel` 插件），暂未实现。
 
 ---
@@ -222,14 +239,15 @@ quick_translate/
 ├─ win-setup.ps1 / win-run.ps1   # Windows 环境安装 / 开发启动
 ├─ mac-setup.sh  / mac-run.sh    # macOS  环境安装 / 开发启动、打包
 ├─ src/                     # Vue 前端
-│  ├─ main.ts               # 按窗口 label 分发浮窗 / 设置界面
+│  ├─ main.ts               # 按窗口 label 分发浮窗 / 问答 / 设置界面
 │  ├─ App.vue               # 翻译浮窗
-│  └─ Settings.vue          # 设置界面（含 macOS 辅助功能授权卡片）
+│  ├─ Ask.vue               # 问答窗（多轮对话 + 引用选中文本）
+│  └─ Settings.vue          # 设置界面（含 macOS 辅助功能授权卡片、热键冲突提示）
 └─ src-tauri/               # Rust 后端
    └─ src/
-      ├─ lib.rs             # 热键 / 取词 / 浮窗 / 托盘 / 命令 / 平台分支
-      ├─ config.rs          # 读写 config.json
-      └─ deepseek.rs        # 流式翻译
+      ├─ lib.rs             # 热键 / 取词 / 浮窗 / 托盘 / 命令 / 平台分支（含 macOS 全屏浮窗）
+      ├─ config.rs          # 读写 config.json（含旧模型名自动迁移）
+      └─ deepseek.rs        # 流式请求：翻译与问答共用
 ```
 
 ---
