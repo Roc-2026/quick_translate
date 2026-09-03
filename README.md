@@ -56,7 +56,7 @@ Intel Mac、或者想改代码，往下看自行构建。
 
 ---
 
-## 🚀 快速开始（Windows）
+## 🚀 自己编译（Windows）
 
 > ⚠️ **Windows 版必须在 Windows 上构建运行**。若你用 WSL/Linux 管理代码，请把项目放到 **Windows 本地盘**再构建——不要在 `\\wsl.localhost\...` 网络路径上跑，`cmd.exe` 不支持 UNC 工作目录。
 
